@@ -1,0 +1,213 @@
+# ============================================================
+# SA-ID Citizen App — CI/CD Pipeline
+# GitHub Actions workflow
+# Triggers on every push to main branch
+# Tests → Lint → Build → Deploy
+# ============================================================
+
+name: SA-ID Citizen App CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+
+  # ── Job 1: Test all pipelines ──────────────────────────────
+  test:
+    name: 🧪 Test Pipelines
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run security audit
+        run: pip-audit || true
+
+      - name: Test Face Auth Pipeline
+        run: |
+          python -c "
+          from citizen_auth_pipeline import run_face_auth_pipeline
+          result = run_face_auth_pipeline('8001015009087')
+          assert result['success'] == True, 'Face auth failed'
+          assert result['liveness'] == 'REAL', 'Liveness check failed'
+          print('✅ Face Auth Pipeline — PASS')
+          "
+
+      - name: Test PIN Auth Pipeline
+        run: |
+          python -c "
+          from citizen_auth_pipeline import run_pin_auth_pipeline
+          result = run_pin_auth_pipeline('8001015009087', '123456')
+          assert result['success'] == True, 'PIN auth failed'
+          print('✅ PIN Auth Pipeline — PASS')
+          "
+
+      - name: Test Document Sign Pipeline
+        run: |
+          python -c "
+          from citizen_sign_pipeline import run_document_sign_pipeline
+          result = run_document_sign_pipeline('8001015009087','legal','Nedbank Ltd')
+          assert result['success'] == True, 'Sign pipeline failed'
+          assert result['legal_status'] == 'LEGALLY_BINDING', 'Legal status wrong'
+          print('✅ Document Sign Pipeline — PASS')
+          "
+
+      - name: Test DHA Lookup Pipeline
+        run: |
+          python -c "
+          from citizen_profile_pipeline import run_dha_lookup_pipeline
+          result = run_dha_lookup_pipeline('8001015009087')
+          assert result['success'] == True, 'DHA lookup failed'
+          assert result['alive_status'] == 'ALIVE', 'Alive status wrong'
+          print('✅ DHA Lookup Pipeline — PASS')
+          "
+
+      - name: Test Grant Status Pipeline
+        run: |
+          python -c "
+          from citizen_payments_pipeline import run_grant_status_pipeline
+          result = run_grant_status_pipeline('8001015009087')
+          assert result['success'] == True, 'Grant status failed'
+          assert result['eligible'] == True, 'Eligibility wrong'
+          print('✅ Grant Status Pipeline — PASS')
+          "
+
+      - name: Test Payment History Pipeline
+        run: |
+          python -c "
+          from citizen_payments_pipeline import run_payment_history_pipeline
+          result = run_payment_history_pipeline('8001015009087', 3)
+          assert result['success'] == True, 'Payment history failed'
+          assert len(result['payments']) == 3, 'Wrong number of payments'
+          print('✅ Payment History Pipeline — PASS')
+          "
+
+      - name: Test Notification Pipeline
+        run: |
+          python -c "
+          from citizen_notification_pipeline import run_notification_pipeline
+          result = run_notification_pipeline('abc123','otp','sms','+27821234567')
+          assert result['success'] == True, 'Notification failed'
+          print('✅ Notification Pipeline — PASS')
+          "
+
+      - name: ✅ All pipeline tests passed
+        run: echo "All 7 citizen pipelines passed!"
+
+  # ── Job 2: API Server test ─────────────────────────────────
+  api-test:
+    name: 🌐 API Server Test
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start server in background
+        run: |
+          python main.py &
+          sleep 4
+
+      - name: Test health endpoint
+        run: |
+          curl -f http://127.0.0.1:8001/api/v1/health/ping
+          echo "✅ Health ping — OK"
+
+      - name: Test ready endpoint
+        run: |
+          curl -f http://127.0.0.1:8001/api/v1/health/ready
+          echo "✅ Health ready — OK"
+
+      - name: Test face auth endpoint
+        run: |
+          curl -f -X POST http://127.0.0.1:8001/api/v1/citizen/auth/face \
+            -H "authorization: Bearer test-api-key-windows-001" \
+            -H "Content-Type: application/json" \
+            -d '{"id_number":"8001015009087","face_data_b64":null}'
+          echo "✅ Face auth endpoint — OK"
+
+      - name: Test grant status endpoint
+        run: |
+          curl -f -X POST http://127.0.0.1:8001/api/v1/citizen/grant/status \
+            -H "authorization: Bearer test-api-key-windows-001" \
+            -H "Content-Type: application/json" \
+            -d '{"id_number":"8001015009087"}'
+          echo "✅ Grant status endpoint — OK"
+
+  # ── Job 3: Build Docker image ──────────────────────────────
+  build:
+    name: 🐳 Build Docker Image
+    runs-on: ubuntu-latest
+    needs: api-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ghcr.io/mrpitt007/sa-id-citizen-app:latest
+            ghcr.io/mrpitt007/sa-id-citizen-app:${{ github.sha }}
+
+  # ── Job 4: Deploy to server ────────────────────────────────
+  deploy:
+    name: 🚀 Deploy to Server
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key:      ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd /opt/sa-id-citizen
+            docker pull ghcr.io/mrpitt007/sa-id-citizen-app:latest
+            docker stop sa-id-citizen || true
+            docker rm   sa-id-citizen || true
+            docker run -d \
+              --name sa-id-citizen \
+              --restart always \
+              -p 8001:8001 \
+              --env-file .env \
+              ghcr.io/mrpitt007/sa-id-citizen-app:latest
+            echo "✅ SA-ID Citizen App deployed!"
